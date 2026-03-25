@@ -1,0 +1,49 @@
+# --- Entornos Virtuales ---
+venv/
+.env/
+.venv/
+env/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- Archivos y carpetas de compilación ---
+build/
+dist/
+*.spec
+
+# --- Archivos de caché de Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Archivos de logs ---
+*.log
+*.tmp
+logs/
+debug.log
+
+# --- Archivos de configuración de IDEs ---
+.vscode/
+.idea/
+
+# --- Archivos generados por cx_Freeze y PyInstaller ---
+*.exe
+*.dll
+*.so
+*.dylib
+
+# --- Archivos de PyInstaller específicos ---
+*.pyz
+*.pyz-extracted/
+*.manifest
+*.ccomp
+
+# --- Archivos de datos de usuario ---
+*.sqlite
+*.db
+*.csv
+
+# --- Archivos de sistema (Windows y macOS) ---
+.DS_Store
+Thumbs.db
+desktop.ini
