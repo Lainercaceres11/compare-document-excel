@@ -1,24 +1,26 @@
 """
 comparar_tiquetes_gui.py
-Preserva el formato completo del archivo FEBRERO original y llena
-NUMERO DEL TIQUETE, FECHA y HORA cuando hay exactamente 1 tiquete por orden+cédula.
+UI profesional con tkinter — tema claro refinado, tipografía elegante,
+animaciones CSS-equivalentes via after(), feedback visual completo.
 """
 
-import subprocess, os, shutil, threading
+import subprocess, os, shutil, threading, math
 import pandas as pd
 from copy import copy
 from openpyxl import load_workbook
-from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
+from openpyxl.styles import PatternFill
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 
-# ── Utilidades ─────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+#  LÓGICA DE PROCESAMIENTO
+# ══════════════════════════════════════════════════════════════════
 
 def buscar_libreoffice():
-    found = shutil.which("libreoffice") or shutil.which("soffice")
+    import shutil as sh
+    found = sh.which("libreoffice") or sh.which("soffice")
     if found:
         return found
     for r in [
@@ -67,7 +69,7 @@ def leer_tiquetes(ruta, log_fn):
     try:
         import xlrd  # noqa
     except ImportError:
-        raise ImportError("Instala xlrd:  pip install xlrd\nO instala LibreOffice.")
+        raise ImportError("Instala xlrd: pip install xlrd\nO instala LibreOffice.")
     df_raw = pd.read_excel(ruta, header=None, engine="xlrd")
     header_row = next(
         i for i, row in df_raw.iterrows()
@@ -88,24 +90,26 @@ def extraer_fecha_hora(valor):
     return dt.strftime("%d/%m/%Y"), dt.strftime("%H:%M:%S")
 
 
-def copiar_estilo(src, dst):
-    """Copia fuente, relleno, borde y alineación de src a dst."""
-    if src.has_style:
-        dst.font      = copy(src.font)
-        dst.fill      = copy(src.fill)
-        dst.border    = copy(src.border)
-        dst.alignment = copy(src.alignment)
-        dst.number_format = src.number_format
+wb_orig_ws = None
 
 
-# ── Procesamiento ──────────────────────────────────────────────────────────────
+def procesar(route_mes, ruta_tiquetes, log_fn, progress_fn):
+    global wb_orig_ws
 
-def procesar(ruta_febrero, ruta_tiquetes, log_fn):
-    log_fn("Leyendo archivos...")
-    df_feb = pd.read_excel(ruta_febrero)
-    df_tiq = leer_tiquetes(ruta_tiquetes, log_fn)
-    log_fn(f"  FEBRERO:  {len(df_feb)} filas")
-    log_fn(f"  TIQUETES: {len(df_tiq)} filas")
+    progress_fn(5)
+    log_fn("INFO", "Leyendo archivo MES 2026...")
+    df_feb     = pd.read_excel(route_mes)
+    wb_orig    = load_workbook(route_mes)
+    wb_orig_ws = wb_orig.active
+
+    progress_fn(15)
+    log_fn("INFO", "Leyendo archivo TIQUETES...")
+    df_tiq = leer_tiquetes(ruta_tiquetes, lambda m: log_fn("INFO", m))
+
+    log_fn("INFO", f"MES: {len(df_feb)} filas  |  TIQUETES: {len(df_tiq)} filas")
+
+    progress_fn(30)
+    log_fn("INFO", "Comparando registros...")
 
     df_feb["_orden"] = normalizar(df_feb["Nro orden de compra"])
     df_feb["_doc"]   = normalizar(df_feb["Número de Documento"])
@@ -115,14 +119,15 @@ def procesar(ruta_febrero, ruta_tiquetes, log_fn):
     conteo           = df_tiq.groupby(["_orden", "_doc"])["TIQUETE"].count()
     claves_unicas    = set(conteo[conteo == 1].index)
     claves_multiples = set(conteo[conteo > 1].index)
-    log_fn(f"  Con 1 tiquete exacto:   {len(claves_unicas)}")
-    log_fn(f"  Con múltiples tiquetes: {len(claves_multiples)}")
+
+    log_fn("OK",   f"Combinaciones únicas encontradas: {len(claves_unicas)}")
+    log_fn("WARN", f"Combinaciones con múltiples tiquetes: {len(claves_multiples)}")
 
     mask      = df_tiq.apply(lambda r: (r["_orden"], r["_doc"]) in claves_unicas, axis=1)
     df_unicos = df_tiq[mask][["_orden", "_doc", "TIQUETE", "FEC.SALIDA"]].copy()
     df_unicos.set_index(["_orden", "_doc"], inplace=True)
 
-    # Construir mapa fila → (tiquete, fecha, hora)
+    progress_fn(45)
     resultados = {}
     filas_ok = filas_multi = filas_no = 0
     for idx, row in df_feb.iterrows():
@@ -139,195 +144,478 @@ def procesar(ruta_febrero, ruta_tiquetes, log_fn):
             else:
                 filas_no += 1
 
-    # ── Escribir sobre una COPIA del original para preservar formato ───────────
-    log_fn("Copiando formato del archivo original...")
+    progress_fn(60)
+    log_fn("INFO", "Copiando formato del archivo original...")
+
     ruta_salida = os.path.join(
-        os.path.dirname(os.path.abspath(ruta_febrero)),
-        os.path.splitext(os.path.basename(ruta_febrero))[0] + "_ACTUALIZADO.xlsx"
+        os.path.dirname(os.path.abspath(route_mes)),
+        os.path.splitext(os.path.basename(route_mes))[0] + "_ACTUALIZADO.xlsx"
     )
-    shutil.copy2(ruta_febrero, ruta_salida)
+    shutil.copy2(route_mes, ruta_salida)
 
     wb = load_workbook(ruta_salida)
     ws = wb.active
 
-    # Mapear nombre de columna → índice Excel (1-based)
-    col_map = {ws.cell(1, c).value: c for c in range(1, ws.max_column + 1)}
-    col_tiq  = col_map.get("NUMERO DEL TIQUETE")
-    col_fec  = col_map.get("FECHA")
-    col_hora = col_map.get("HORA")
-
-    # Estilo de referencia para celdas llenas (tomado de fila 2 si existe)
-    ref_row = 2 if ws.max_row >= 2 else 1
+    col_map  = {ws.cell(1, c).value: c for c in range(1, ws.max_column + 1)}
+    col_tiq  = col_map["NUMERO DEL TIQUETE"]
+    col_fec  = col_map["FECHA"]
+    col_hora = col_map["HORA"]
+    col_cant = col_map["Cantidad de Pasajes"]
+    col_tar  = col_map["Tarifa"]
+    col_tot  = col_map["TOTAL"]
+    n_cols   = ws.max_column
 
     amarillo = PatternFill("solid", fgColor="FFFF00")
 
-    log_fn("Llenando celdas...")
-    for df_idx, (tiquete, fecha, hora) in resultados.items():
-        excel_row = df_idx + 2  # +1 header, +1 base-1
-        if tiquete is not None:
-            ws.cell(excel_row, col_tiq).value = tiquete
-            ws.cell(excel_row, col_fec).value = fecha
-            ws.cell(excel_row, col_hora).value = hora
-            # Resaltar en amarillo solo las celdas recién llenadas
-            for col in [col_tiq, col_fec, col_hora]:
-                ws.cell(excel_row, col).fill = amarillo
+    plan = []
+    for df_idx in df_feb.index:
+        excel_row_orig = df_idx + 2
+        cantidad = wb_orig_ws.cell(excel_row_orig, col_cant).value
+        try:
+            cantidad = int(cantidad) if cantidad and cantidad > 0 else 1
+        except (TypeError, ValueError):
+            cantidad = 1
+        tiquete, fecha, hora = resultados[df_idx]
+        plan.append((excel_row_orig, cantidad, tiquete, fecha, hora))
 
+    progress_fn(70)
+    log_fn("INFO", "Expandiendo filas y escribiendo datos...")
+
+    ws.delete_rows(2, ws.max_row - 1)
+
+    filas_expandidas = 0
+    write_row = 2
+
+    for (orig_row, cantidad, tiquete, fecha, hora) in plan:
+        for rep in range(cantidad):
+            ws.append([None] * n_cols)
+            for c in range(1, n_cols + 1):
+                src = wb_orig_ws.cell(orig_row, c)
+                dst = ws.cell(write_row, c)
+                if src.has_style:
+                    dst.font          = copy(src.font)
+                    dst.fill          = copy(src.fill)
+                    dst.border        = copy(src.border)
+                    dst.alignment     = copy(src.alignment)
+                    dst.number_format = src.number_format
+                if c == col_cant:
+                    dst.value = 1
+                elif c == col_tot:
+                    tarifa = wb_orig_ws.cell(orig_row, col_tar).value or 0
+                    dst.value = tarifa
+                else:
+                    dst.value = src.value
+            if tiquete is not None:
+                ws.cell(write_row, col_tiq).value = tiquete
+                ws.cell(write_row, col_fec).value = fecha
+                ws.cell(write_row, col_hora).value = hora
+                for col in [col_tiq, col_fec, col_hora]:
+                    ws.cell(write_row, col).fill = amarillo
+            if cantidad > 1:
+                filas_expandidas += 1
+            write_row += 1
+
+    progress_fn(90)
+    log_fn("INFO", "Guardando archivo...")
     wb.save(ruta_salida)
+    progress_fn(100)
 
-    log_fn("─" * 46)
-    log_fn(f"✅  Filas actualizadas              : {filas_ok}")
-    log_fn(f"⚠️   Múltiples tiquetes (sin llenar): {filas_multi}")
-    log_fn(f"❌  Sin coincidencia                : {filas_no}")
-    log_fn("─" * 46)
-    log_fn(f"📄  Archivo guardado en:")
-    log_fn(f"    {ruta_salida}")
-    return ruta_salida, filas_ok, filas_multi, filas_no
+    total_filas = write_row - 2
+    log_fn("OK",   f"Filas actualizadas con tiquete: {filas_ok}")
+    log_fn("WARN", f"Sin llenar (múltiples tiquetes): {filas_multi}")
+    log_fn("ERR",  f"Sin coincidencia: {filas_no}")
+    log_fn("OK",   f"Filas expandidas (pasajes > 1): {filas_expandidas}")
+    log_fn("OK",   f"Total filas en archivo final: {total_filas}")
+
+    return ruta_salida, filas_ok, filas_multi, filas_no, filas_expandidas, total_filas
 
 
-# ── Interfaz gráfica ───────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+#  INTERFAZ GRÁFICA
+# ══════════════════════════════════════════════════════════════════
+
+# ── Paleta ─────────────────────────────────────────────────────────
+C = {
+    "bg":           "#F7F6F3",
+    "surface":      "#FFFFFF",
+    "surface2":     "#F0EEE9",
+    "border":       "#E2DED6",
+    "border_focus": "#1A1A1A",
+    "text":         "#1A1A1A",
+    "text2":        "#6B6860",
+    "text3":        "#A09D97",
+    "accent":       "#1A1A1A",
+    "accent_hover": "#333333",
+    "ok":           "#1B7A4A",
+    "ok_bg":        "#EBF7F1",
+    "warn":         "#9A6500",
+    "warn_bg":      "#FFF8E6",
+    "err":          "#C0392B",
+    "err_bg":       "#FDECEA",
+    "info":         "#1A4A7A",
+    "info_bg":      "#EBF2FB",
+    "progress_bg":  "#E8E6E1",
+    "progress_fill":"#1A1A1A",
+}
+
+FONT_TITLE  = ("Georgia", 18, "bold")
+FONT_SUB    = ("Georgia", 10, "italic")
+FONT_LABEL  = ("Helvetica", 9, "bold")
+FONT_BODY   = ("Helvetica", 10)
+FONT_SMALL  = ("Helvetica", 8)
+FONT_LOG    = ("Courier", 9)
+FONT_BTN    = ("Helvetica", 11, "bold")
+FONT_STAT   = ("Georgia", 22, "bold")
+FONT_STAT_L = ("Helvetica", 8)
+
+
+class FileCard(tk.Frame):
+    """Card de selección de archivo con número, etiqueta, ruta y botón."""
+    def __init__(self, parent, number, label, extensions, **kw):
+        super().__init__(parent, bg=C["surface"],
+                         highlightbackground=C["border"],
+                         highlightthickness=1, **kw)
+        self.var = tk.StringVar()
+        self._active = False
+
+        # Número de paso
+        num_frame = tk.Frame(self, bg=C["accent"], width=32, height=32)
+        num_frame.pack_propagate(False)
+        num_frame.pack(side="left", padx=(16, 12), pady=16)
+        tk.Label(num_frame, text=str(number), font=("Helvetica", 11, "bold"),
+                 fg=C["surface"], bg=C["accent"]).place(relx=0.5, rely=0.5, anchor="center")
+
+        # Contenido central
+        center = tk.Frame(self, bg=C["surface"])
+        center.pack(side="left", fill="x", expand=True, pady=12)
+
+        tk.Label(center, text=label.upper(), font=FONT_LABEL,
+                 fg=C["text2"], bg=C["surface"], anchor="w").pack(fill="x")
+
+        self.path_label = tk.Label(center, textvariable=self.var,
+                                   font=FONT_BODY, fg=C["text3"],
+                                   bg=C["surface"], anchor="w",
+                                   cursor="hand2")
+        self.path_label.pack(fill="x")
+        self.path_label.configure(text="Haz clic para seleccionar archivo…")
+
+        # Botón
+        self.btn = tk.Button(self, text="Examinar",
+                             font=FONT_SMALL,
+                             fg=C["text"], bg=C["surface2"],
+                             activebackground=C["border"],
+                             activeforeground=C["text"],
+                             relief="flat", bd=0,
+                             padx=14, pady=6,
+                             cursor="hand2",
+                             command=lambda: self._browse(extensions))
+        self.btn.pack(side="right", padx=16, pady=16)
+
+        # Indicador de estado (punto de color)
+        self.dot = tk.Label(self, text="●", font=("Helvetica", 8),
+                            fg=C["border"], bg=C["surface"])
+        self.dot.place(relx=1.0, rely=0.0, x=-8, y=8, anchor="ne")
+
+        # Hover
+        for w in [self, center, self.path_label]:
+            w.bind("<Enter>", self._on_enter)
+            w.bind("<Leave>", self._on_leave)
+            w.bind("<Button-1>", lambda e, ext=extensions: self._browse(ext))
+
+    def _browse(self, extensions):
+        path = filedialog.askopenfilename(filetypes=[("Excel", extensions)])
+        if path:
+            self.var.set(path)
+            name = os.path.basename(path)
+            self.path_label.configure(text=name, fg=C["text"])
+            self.dot.configure(fg=C["ok"])
+            self._set_border(C["ok"])
+
+    def _on_enter(self, e):
+        if not self.var.get():
+            self._set_border(C["border_focus"])
+
+    def _on_leave(self, e):
+        if not self.var.get():
+            self._set_border(C["border"])
+
+    def _set_border(self, color):
+        self.configure(highlightbackground=color)
+
+    def get(self):
+        return self.var.get().strip()
+
+
+class StatCard(tk.Frame):
+    """Tarjeta de estadística con número grande y etiqueta."""
+    def __init__(self, parent, label, color_key="ok", **kw):
+        bg = C[color_key + "_bg"]
+        fg = C[color_key]
+        super().__init__(parent, bg=bg,
+                         highlightbackground=C["border"],
+                         highlightthickness=1, **kw)
+        self.value_var = tk.StringVar(value="—")
+        tk.Label(self, textvariable=self.value_var,
+                 font=FONT_STAT, fg=fg, bg=bg).pack(pady=(14, 2))
+        tk.Label(self, text=label.upper(),
+                 font=FONT_STAT_L, fg=fg, bg=bg,
+                 wraplength=110, justify="center").pack(pady=(0, 14))
+
+    def set(self, val):
+        self.value_var.set(str(val))
+
+
+class LogLine(tk.Frame):
+    """Línea de log con ícono de nivel y mensaje."""
+    ICONS = {"OK": "✓", "WARN": "⚠", "ERR": "✕", "INFO": "·"}
+    COLORS = {
+        "OK":   (C["ok"],   C["ok_bg"]),
+        "WARN": (C["warn"], C["warn_bg"]),
+        "ERR":  (C["err"],  C["err_bg"]),
+        "INFO": (C["text2"], C["surface"]),
+    }
+
+    def __init__(self, parent, level, message, **kw):
+        fg, bg = self.COLORS.get(level, (C["text2"], C["surface"]))
+        super().__init__(parent, bg=bg, **kw)
+        tk.Label(self, text=self.ICONS.get(level, "·"),
+                 font=("Helvetica", 9, "bold"),
+                 fg=fg, bg=bg, width=2).pack(side="left", padx=(8, 4), pady=3)
+        tk.Label(self, text=message,
+                 font=FONT_LOG, fg=fg if level != "INFO" else C["text2"],
+                 bg=bg, anchor="w").pack(side="left", fill="x", pady=3, padx=(0, 8))
+
+
+class AnimatedButton(tk.Button):
+    """Botón principal con animación de hover."""
+    def __init__(self, parent, **kw):
+        super().__init__(parent,
+                         bg=C["accent"], fg=C["surface"],
+                         activebackground=C["accent_hover"],
+                         activeforeground=C["surface"],
+                         relief="flat", bd=0,
+                         cursor="hand2",
+                         font=FONT_BTN,
+                         pady=14,
+                         **kw)
+        self.bind("<Enter>", lambda e: self.configure(bg=C["accent_hover"]))
+        self.bind("<Leave>", lambda e: self.configure(bg=C["accent"]))
+
+
+class ProgressBar(tk.Canvas):
+    """Barra de progreso personalizada con animación suave."""
+    def __init__(self, parent, **kw):
+        super().__init__(parent, height=4, bg=C["progress_bg"],
+                         highlightthickness=0, **kw)
+        self._pct    = 0
+        self._target = 0
+        self._bar    = self.create_rectangle(0, 0, 0, 4, fill=C["progress_fill"], width=0)
+        self.bind("<Configure>", self._redraw)
+
+    def _redraw(self, e=None):
+        w = self.winfo_width()
+        x = int(w * self._pct / 100)
+        self.coords(self._bar, 0, 0, x, 4)
+
+    def set_target(self, pct):
+        self._target = pct
+        self._animate()
+
+    def _animate(self):
+        if abs(self._pct - self._target) < 0.5:
+            self._pct = self._target
+            self._redraw()
+            return
+        self._pct += (self._target - self._pct) * 0.15
+        self._redraw()
+        self.after(16, self._animate)
+
+    def reset(self):
+        self._pct    = 0
+        self._target = 0
+        self._redraw()
+
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Comparador de Tiquetes – FEBRERO 2026")
+        self.title("Comparador de Tiquetes")
+        self.configure(bg=C["bg"])
         self.resizable(False, False)
-        self.configure(bg="#1a1a2e")
-        self._build_ui()
+        self._build()
 
-    def _build_ui(self):
-        BG    = "#1a1a2e"
-        CARD  = "#16213e"
-        ACC   = "#e94560"
-        ACC2  = "#0f3460"
-        TXT   = "#eaeaea"
-        MUTED = "#8892a4"
-        PAD   = 18
+    def _build(self):
+        # ── Contenedor principal con padding ──────────────────────
+        outer = tk.Frame(self, bg=C["bg"])
+        outer.pack(fill="both", expand=True, padx=32, pady=28)
 
-        hdr = tk.Frame(self, bg=ACC2, pady=14)
-        hdr.pack(fill="x")
-        tk.Label(hdr, text="COMPARADOR DE TIQUETES",
-                 font=("Courier New", 15, "bold"), fg=ACC, bg=ACC2).pack()
-        tk.Label(hdr, text="Febrero 2026  •  Actualización automática",
-                 font=("Courier New", 9), fg=MUTED, bg=ACC2).pack()
+        # ── Encabezado ─────────────────────────────────────────────
+        header = tk.Frame(outer, bg=C["bg"])
+        header.pack(fill="x", pady=(0, 24))
 
-        body = tk.Frame(self, bg=BG, padx=PAD, pady=PAD)
-        body.pack(fill="both")
+        tk.Label(header, text="Comparador", font=FONT_TITLE,
+                 fg=C["text"], bg=C["bg"]).pack(side="left")
+        tk.Label(header, text=" de Tiquetes",
+                 font=("Georgia", 18), fg=C["text2"], bg=C["bg"]).pack(side="left")
 
-        def file_row(parent, label, var, tipos):
-            row = tk.Frame(parent, bg=CARD, padx=12, pady=10)
-            row.pack(fill="x", pady=5)
-            tk.Label(row, text=label, font=("Courier New", 8, "bold"),
-                     fg=MUTED, bg=CARD, anchor="w").pack(fill="x")
-            inner = tk.Frame(row, bg=CARD)
-            inner.pack(fill="x")
-            e = tk.Entry(inner, textvariable=var, font=("Courier New", 9),
-                         bg="#0d1b2a", fg=TXT, insertbackground=TXT,
-                         relief="flat", bd=0, state="readonly",
-                         readonlybackground="#0d1b2a")
-            e.pack(side="left", fill="x", expand=True, ipady=5, padx=(0, 8))
-            tk.Button(inner, text="EXAMINAR",
-                      font=("Courier New", 8, "bold"),
-                      bg=ACC2, fg=ACC, activebackground=ACC,
-                      activeforeground="#fff", relief="flat", bd=0,
-                      padx=10, cursor="hand2",
-                      command=lambda v=var, t=tipos: self._browse(v, t)
-                      ).pack(side="right")
+        tk.Label(header, text="MES",
+                 font=FONT_SUB, fg=C["text3"], bg=C["bg"]).pack(side="right", anchor="s", pady=4)
 
-        self.var_feb = tk.StringVar()
-        self.var_tiq = tk.StringVar()
-        file_row(body, "1.  ARCHIVO FEBRERO 2026  (.xlsx)",
-                 self.var_feb, [("Excel", "*.xlsx *.xls")])
-        file_row(body, "2.  ARCHIVO TIQUETES  (.xls / .xlsx)",
-                 self.var_tiq, [("Excel", "*.xls *.xlsx")])
+        # Línea divisora
+        tk.Frame(outer, bg=C["border"], height=1).pack(fill="x", pady=(0, 24))
 
-        nota = tk.Frame(body, bg="#0d1b2a", padx=12, pady=8)
-        nota.pack(fill="x", pady=(0, 5))
+        # ── Sección: archivos de entrada ───────────────────────────
+        tk.Label(outer, text="ARCHIVOS DE ENTRADA",
+                 font=FONT_LABEL, fg=C["text3"], bg=C["bg"],
+                 anchor="w").pack(fill="x", pady=(0, 8))
+
+        self.card_feb = FileCard(outer, 1, "Archivo MES 2026",
+                                 "*.xlsx *.xls")
+        self.card_feb.pack(fill="x", pady=(0, 8))
+
+        self.card_tiq = FileCard(outer, 2, "Archivo de Tiquetes",
+                                 "*.xls *.xlsx")
+        self.card_tiq.pack(fill="x")
+
+        # Nota salida
+        nota = tk.Frame(outer, bg=C["info_bg"],
+                        highlightbackground=C["border"], highlightthickness=1)
+        nota.pack(fill="x", pady=(12, 0))
         tk.Label(nota,
-                 text="📄  El archivo actualizado se generará automáticamente\n"
-                      "    en la misma carpeta que el archivo FEBRERO 2026.",
-                 font=("Courier New", 8), fg=MUTED, bg="#0d1b2a",
-                 justify="left").pack(anchor="w")
+                 text="El archivo actualizado se generará en la misma carpeta que el archivo MES 2026.",
+                 font=FONT_SMALL, fg=C["info"], bg=C["info_bg"],
+                 anchor="w", pady=8, padx=12).pack(fill="x")
 
-        self.btn_run = tk.Button(body, text="▶  PROCESAR",
-                                 font=("Courier New", 11, "bold"),
-                                 bg=ACC, fg="#fff",
-                                 activebackground="#c73652",
-                                 activeforeground="#fff",
-                                 relief="flat", bd=0, pady=10,
-                                 cursor="hand2", command=self._run)
-        self.btn_run.pack(fill="x", pady=(6, 5))
+        # ── Progreso ───────────────────────────────────────────────
+        tk.Frame(outer, bg=C["border"], height=1).pack(fill="x", pady=(24, 16))
 
-        log_frame = tk.Frame(body, bg=CARD, padx=8, pady=8)
-        log_frame.pack(fill="both", expand=True, pady=(4, 0))
-        tk.Label(log_frame, text="REGISTRO", font=("Courier New", 7, "bold"),
-                 fg=MUTED, bg=CARD, anchor="w").pack(fill="x")
-        self.log_text = tk.Text(log_frame, height=13, width=62,
-                                font=("Courier New", 9),
-                                bg="#0d1b2a", fg="#7effa0",
-                                insertbackground="#7effa0",
-                                relief="flat", bd=0, state="disabled",
-                                wrap="word")
-        sb = ttk.Scrollbar(log_frame, command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=sb.set)
-        self.log_text.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
+        self.progress = ProgressBar(outer, width=480)
+        self.progress.pack(fill="x", pady=(0, 8))
 
-        self.progress = ttk.Progressbar(body, mode="indeterminate", length=400)
-        self.progress.pack(fill="x", pady=(6, 0))
+        self.status_var = tk.StringVar(value="Listo para procesar")
+        tk.Label(outer, textvariable=self.status_var,
+                 font=FONT_SMALL, fg=C["text3"], bg=C["bg"],
+                 anchor="w").pack(fill="x")
 
-        style = ttk.Style(self)
-        style.theme_use("clam")
-        style.configure("TScrollbar", background=ACC2, troughcolor=CARD,
-                        arrowcolor=MUTED, bordercolor=CARD)
-        style.configure("TProgressbar", troughcolor=CARD,
-                        background=ACC, bordercolor=CARD)
+        # ── Botón ──────────────────────────────────────────────────
+        self.btn = AnimatedButton(outer, text="Procesar archivos",
+                                  command=self._run)
+        self.btn.pack(fill="x", pady=(16, 0))
 
-    def _browse(self, var, tipos):
-        path = filedialog.askopenfilename(filetypes=tipos)
-        if path:
-            var.set(path)
+        # ── Estadísticas ───────────────────────────────────────────
+        tk.Frame(outer, bg=C["border"], height=1).pack(fill="x", pady=(24, 16))
 
-    def _log(self, msg):
-        self.log_text.configure(state="normal")
-        self.log_text.insert("end", msg + "\n")
-        self.log_text.see("end")
-        self.log_text.configure(state="disabled")
+        tk.Label(outer, text="RESULTADOS",
+                 font=FONT_LABEL, fg=C["text3"], bg=C["bg"],
+                 anchor="w").pack(fill="x", pady=(0, 10))
+
+        stats_frame = tk.Frame(outer, bg=C["bg"])
+        stats_frame.pack(fill="x")
+
+        self.stat_ok    = StatCard(stats_frame, "Actualizadas",   "ok")
+        self.stat_multi = StatCard(stats_frame, "Múlt. tiquetes", "warn")
+        self.stat_no    = StatCard(stats_frame, "Sin match",      "err")
+        self.stat_total = StatCard(stats_frame, "Filas totales",  "info")
+
+        for i, s in enumerate([self.stat_ok, self.stat_multi, self.stat_no, self.stat_total]):
+            s.grid(row=0, column=i, padx=(0, 8) if i < 3 else 0, sticky="nsew")
+            stats_frame.columnconfigure(i, weight=1)
+
+        # ── Log ────────────────────────────────────────────────────
+        tk.Frame(outer, bg=C["border"], height=1).pack(fill="x", pady=(24, 16))
+
+        tk.Label(outer, text="REGISTRO DE ACTIVIDAD",
+                 font=FONT_LABEL, fg=C["text3"], bg=C["bg"],
+                 anchor="w").pack(fill="x", pady=(0, 8))
+
+        log_container = tk.Frame(outer, bg=C["surface"],
+                                 highlightbackground=C["border"],
+                                 highlightthickness=1)
+        log_container.pack(fill="both")
+
+        self.log_inner = tk.Frame(log_container, bg=C["surface"])
+        self.log_inner.pack(fill="both", expand=True)
+
+        # Placeholder
+        self.log_placeholder = tk.Label(
+            self.log_inner,
+            text="El registro de actividad aparecerá aquí una vez iniciado el proceso.",
+            font=FONT_SMALL, fg=C["text3"], bg=C["surface"],
+            pady=20
+        )
+        self.log_placeholder.pack()
+
+        self._log_lines = []
+
+    def _add_log(self, level, message):
+        if self.log_placeholder.winfo_ismapped():
+            self.log_placeholder.pack_forget()
+        line = LogLine(self.log_inner, level, message)
+        line.pack(fill="x")
+        self._log_lines.append(line)
+        self.log_inner.update_idletasks()
+
+    def _clear_log(self):
+        for w in self._log_lines:
+            w.destroy()
+        self._log_lines = []
+        self.log_placeholder.pack()
+
+    def _set_status(self, text):
+        self.status_var.set(text)
 
     def _run(self):
-        feb = self.var_feb.get().strip()
-        tiq = self.var_tiq.get().strip()
+        feb = self.card_feb.get()
+        tiq = self.card_tiq.get()
         if not feb or not tiq:
-            messagebox.showwarning("Campos vacíos",
-                                   "Por favor selecciona los dos archivos.")
+            messagebox.showwarning(
+                "Archivos requeridos",
+                "Por favor selecciona los dos archivos antes de continuar."
+            )
             return
-        self.btn_run.configure(state="disabled", text="Procesando...")
-        self.progress.start(12)
-        self.log_text.configure(state="normal")
-        self.log_text.delete("1.0", "end")
-        self.log_text.configure(state="disabled")
+
+        self.btn.configure(state="disabled", text="Procesando…")
+        self.progress.reset()
+        self._clear_log()
+        self.stat_ok.set("—")
+        self.stat_multi.set("—")
+        self.stat_no.set("—")
+        self.stat_total.set("—")
+
+        def log_fn(level, msg):
+            self.after(0, lambda: self._add_log(level, msg))
+
+        def progress_fn(pct):
+            self.after(0, lambda: self.progress.set_target(pct))
+            self.after(0, lambda: self._set_status(f"Procesando… {pct}%"))
 
         def worker():
             try:
-                ruta, ok, multi, no = procesar(feb, tiq, self._log)
-                self.after(0, lambda: messagebox.showinfo(
-                    "Completado",
-                    f"¡Proceso terminado!\n\n"
-                    f"✅  Filas actualizadas: {ok}\n"
-                    f"⚠️   Múltiples tiquetes: {multi}\n"
-                    f"❌  Sin coincidencia: {no}\n\n"
-                    f"Archivo guardado en:\n{ruta}"
-                ))
+                ruta, ok, multi, no, exp, total = procesar(
+                    feb, tiq, log_fn, progress_fn
+                )
+                def done():
+                    self.stat_ok.set(ok)
+                    self.stat_multi.set(multi)
+                    self.stat_no.set(no)
+                    self.stat_total.set(total)
+                    self._set_status(f"Completado — {os.path.basename(ruta)}")
+                    self.btn.configure(state="normal", text="Procesar archivos")
+                    messagebox.showinfo(
+                        "Proceso completado",
+                        f"Archivo generado exitosamente.\n\n"
+                        f"Ubicación:\n{ruta}"
+                    )
+                self.after(0, done)
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Error", str(e)))
-                self._log(f"\n❌ ERROR: {e}")
-            finally:
-                self.after(0, self._done)
+                def on_err():
+                    self._add_log("ERR", str(e))
+                    self._set_status("Error durante el proceso")
+                    self.btn.configure(state="normal", text="Procesar archivos")
+                    messagebox.showerror("Error", str(e))
+                self.after(0, on_err)
 
         threading.Thread(target=worker, daemon=True).start()
-
-    def _done(self):
-        self.progress.stop()
-        self.btn_run.configure(state="normal", text="▶  PROCESAR")
 
 
 if __name__ == "__main__":
