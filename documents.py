@@ -6,24 +6,28 @@ PROPÓSITO (reutilizable para cualquier mes):
 Cruza dos archivos Excel periódicos de COMFACHOCO:
 
   Archivo MES (ej. FEBRERO_2026_PARA_LAINER.xlsx)
-    Col A: Nro orden de compra  ← clave de comparación
-    Col B: NUMERO DEL TIQUETE   ← se llena con este proceso
-    Col C: FECHA                ← se llena con este proceso
-    Col D: HORA                 ← se llena con este proceso
-    Col J: Número de Documento  ← clave de comparación (cédula)
-    Col N: Cantidad de Pasajes  ← controla la expansión de filas
+    Col A: Nro orden de compra   <- clave de comparación
+    Col B: NUMERO DEL TIQUETE    <- se llena con este proceso
+    Col C: FECHA                 <- se llena con este proceso
+    Col D: HORA                  <- se llena con este proceso
+    Col J: Número de Documento   <- clave de comparación (cédula)
+    Col N: Cantidad de Pasajes   <- controla la expansión de filas
 
   Archivo TIQUETES (ej. TIQUETES_EXPEDIDIOS_EN_FEBRERO_2026.xls)
-    Col K: CEDULA PASAJERO  ← clave de comparación con col J de MES
-    Col M: FEC.SALIDA       ← fecha + hora del viaje (se separa)
-    Col N: NRO ORDEN CREDITO ← clave de comparación con col A de MES
+    Col K: CEDULA PASAJERO       <- clave de comparación con col J de MES
+    Col M: FEC.SALIDA            <- fecha + hora del viaje (se separa)
+    Col N: NRO ORDEN CREDITO     <- clave de comparación con col A de MES
 
-ESTRATEGIA DE COMPARACIÓN (punto 3):
-  Coincide si:  CEDULA (K==J)  Y  cualquiera de estas condiciones de orden:
+ESTRATEGIA DE COMPARACIÓN:
+  Coincide si: CEDULA (K==J)  Y  orden compatible (N~=A):
     1. Match exacto:  str(orden_tiq) == str(orden_mes)
     2. Match prefijo: str(orden_tiq).startswith(str(orden_mes))
-    3. Match fuzzy:   abs(int(orden_tiq) - int(orden_mes)) <= 20
-       (captura diferencias de numeración entre sistemas, ej. 2026035807 ↔ 2026035817)
+       (NRO ORDEN CREDITO puede tener dígitos extra al final,
+        ej. FEBRERO=2026017179 <-> TIQUETES=20260171799)
+
+  NO se usa matching numérico aproximado porque órdenes de ida y vuelta
+  del mismo usuario tienen números consecutivos (ej. 2026026318 y 2026026328)
+  y mezclarlas sería incorrecto.
 
 NOTAS:
   - Cada tiquete se asigna una sola vez (no se repite).
@@ -37,9 +41,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 from datetime import datetime
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-
-FUZZY_UMBRAL = 20   # diferencia máxima entre números de orden para considerar match
+from tkinter import filedialog, messagebox
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -61,38 +63,94 @@ def buscar_libreoffice():
     return None
 
 
-def convertir_xls(ruta_xls, ejecutable):
-    carpeta = os.path.dirname(os.path.abspath(ruta_xls))
-    base    = os.path.splitext(os.path.basename(ruta_xls))[0]
-    destino = os.path.join(carpeta, base + "_converted.xlsx")
+def convertir_xls(ruta_xls, ejecutable, log_fn):
+    """
+    Convierte .xls a .xlsx usando LibreOffice.
+
+    CORRECCIONES vs versión anterior:
+      1. Invalida la caché si el .xls es más nuevo que el _converted.xlsx.
+      2. Busca el archivo de salida en múltiples directorios porque
+         LibreOffice a veces ignora --outdir y escribe en el directorio
+         de trabajo actual o en la raíz del sistema de archivos.
+    """
+    carpeta    = os.path.dirname(os.path.abspath(ruta_xls))
+    base       = os.path.splitext(os.path.basename(ruta_xls))[0]
+    destino    = os.path.join(carpeta, base + "_converted.xlsx")
+
+    # ── CORRECCIÓN 1: invalidar caché si el xls es más reciente ──
     if os.path.exists(destino):
-        return destino
+        mtime_xls     = os.path.getmtime(ruta_xls)
+        mtime_destino = os.path.getmtime(destino)
+        if mtime_xls > mtime_destino:
+            log_fn("INFO", "  Caché de conversión obsoleta, reconvirtiendo...")
+            os.remove(destino)
+        else:
+            log_fn("INFO", "  Usando conversión en caché...")
+            return destino
+
+    # ── Ejecutar LibreOffice ──────────────────────────────────────
+    cwd = os.getcwd()
     result = subprocess.run(
         [ejecutable, "--headless", "--convert-to", "xlsx",
          os.path.abspath(ruta_xls), "--outdir", carpeta],
-        capture_output=True, text=True
+        capture_output=True, text=True,
+        cwd=carpeta   # forzar directorio de trabajo = carpeta del archivo
     )
     if result.returncode != 0:
         raise RuntimeError(f"LibreOffice no pudo convertir el archivo.\n{result.stderr}")
-    convertido = os.path.join(carpeta, base + ".xlsx")
-    if os.path.exists(convertido) and convertido != destino:
-        os.rename(convertido, destino)
+
+    # ── CORRECCIÓN 2: buscar el archivo en múltiples ubicaciones ──
+    nombre_xlsx = base + ".xlsx"
+    posibles    = [
+        os.path.join(carpeta, nombre_xlsx),          # lo normal
+        os.path.join(cwd, nombre_xlsx),              # directorio de trabajo
+        os.path.join("/", nombre_xlsx),              # raíz (Linux/Mac)
+        os.path.join(os.path.expanduser("~"), nombre_xlsx),  # home
+    ]
+
+    encontrado = None
+    for p in posibles:
+        if os.path.exists(p):
+            encontrado = p
+            break
+
+    if encontrado is None:
+        raise RuntimeError(
+            f"LibreOffice completó sin errores pero no se encontró el archivo "
+            f"convertido '{nombre_xlsx}'.\n"
+            f"Se buscó en: {posibles}\n"
+            f"Salida de LibreOffice: {result.stdout}"
+        )
+
+    if encontrado != destino:
+        shutil.move(encontrado, destino)
+
     return destino
 
 
 def leer_tiquetes(ruta, log_fn):
+    """Lee TIQUETES EXPEDIDOS (.xls o .xlsx). El encabezado real está en la fila 6."""
     ext = os.path.splitext(ruta)[1].lower()
     if ext == ".xlsx":
         df = pd.read_excel(ruta, header=5)
         df.columns = df.columns.str.strip()
         return df
+
     lo = buscar_libreoffice()
     if lo:
         log_fn("INFO", "  Convirtiendo .xls con LibreOffice...")
-        ruta = convertir_xls(ruta, lo)
-        df = pd.read_excel(ruta, header=5)
+        ruta_conv = convertir_xls(ruta, lo, log_fn)
+        df = pd.read_excel(ruta_conv, header=5)
         df.columns = df.columns.str.strip()
+        # Verificar que el archivo tiene datos reales
+        if df.empty or "CEDULA PASAJERO" not in df.columns:
+            raise RuntimeError(
+                "El archivo de tiquetes convertido no tiene la estructura esperada.\n"
+                f"Columnas encontradas: {list(df.columns)}\n"
+                "Asegúrese de que el archivo .xls es el correcto."
+            )
         return df
+
     log_fn("INFO", "  Usando xlrd para leer .xls...")
     try:
         import xlrd  # noqa
@@ -111,6 +169,7 @@ def leer_tiquetes(ruta, log_fn):
 
 
 def to_str_orden(v):
+    """Convierte un número de orden a string entero limpio."""
     try:
         return str(int(float(v))) if v is not None and not pd.isna(v) else ""
     except (ValueError, TypeError):
@@ -118,6 +177,7 @@ def to_str_orden(v):
 
 
 def to_str_doc(v):
+    """Convierte un número de documento/cédula a string entero limpio."""
     try:
         return str(int(float(v))) if v is not None and not pd.isna(v) else ""
     except (ValueError, TypeError):
@@ -125,6 +185,7 @@ def to_str_doc(v):
 
 
 def separar_fecha_hora(valor):
+    """Separa FEC.SALIDA en (fecha 'DD/MM/YYYY', hora 'HH:MM:SS')."""
     if valor is None or (isinstance(valor, float) and pd.isna(valor)):
         return None, None
     if isinstance(valor, datetime):
@@ -136,57 +197,61 @@ def separar_fecha_hora(valor):
         return str(valor), None
 
 
-def orden_coincide(o_mes: str, o_tiq: str) -> bool:
+def orden_coincide(o_mes, o_tiq):
     """
-    Retorna True si las dos cadenas de orden se consideran la misma:
-      - Match exacto
-      - Match prefijo (o_tiq empieza con o_mes, para órdenes con dígitos extra)
-      - Match fuzzy: diferencia numérica <= FUZZY_UMBRAL
-        (captura variaciones de numeración entre sistemas COMFACHOCO)
+    True si o_mes y o_tiq se consideran la misma orden:
+      - Exacto: o_tiq == o_mes
+      - Prefijo: o_tiq.startswith(o_mes)  (dígitos extra en TIQUETES)
     """
     if not o_mes or not o_tiq:
         return False
-    if o_tiq == o_mes or o_tiq.startswith(o_mes):
-        return True
-    try:
-        return abs(int(o_tiq) - int(o_mes)) <= FUZZY_UMBRAL
-    except ValueError:
-        return False
+    return o_tiq == o_mes or o_tiq.startswith(o_mes)
 
 
 # ══════════════════════════════════════════════════════════════════
 #  NÚCLEO DEL PROCESO
 # ══════════════════════════════════════════════════════════════════
 
-wb_orig_ws = None
+_wb_orig_ws = None   # referencia global al ws original (para copiar estilos)
 
 
 def procesar(ruta_mes, ruta_tiquetes, log_fn, progress_fn):
-    global wb_orig_ws
+    global _wb_orig_ws
 
+    # ── Leer archivos ──────────────────────────────────────────────
     progress_fn(5)
     log_fn("INFO", "Leyendo archivo MES...")
-    df_mes  = pd.read_excel(ruta_mes)
-    wb_orig = load_workbook(ruta_mes)
-    wb_orig_ws = wb_orig.active
+    df_mes    = pd.read_excel(ruta_mes)
+    wb_orig   = load_workbook(ruta_mes)
+    _wb_orig_ws = wb_orig.active
 
     progress_fn(15)
     log_fn("INFO", "Leyendo archivo TIQUETES EXPEDIDOS...")
     df_tiq = leer_tiquetes(ruta_tiquetes, log_fn)
     log_fn("INFO", f"MES: {len(df_mes)} filas  |  TIQUETES: {len(df_tiq)} filas")
 
-    # ── Paso 1: construir índice de tiquetes con fecha/hora separadas ──
+    # ── Validación temprana ────────────────────────────────────────
+    cols_tiq = set(df_tiq.columns.tolist())
+    for col_req in ("TIQUETE", "CEDULA PASAJERO", "FEC.SALIDA", "NRO ORDEN CREDITO"):
+        if col_req not in cols_tiq:
+            raise RuntimeError(
+                f"No se encontró la columna '{col_req}' en el archivo de tiquetes.\n"
+                f"Columnas disponibles: {sorted(cols_tiq)}"
+            )
+
+    # ── Paso 1: índice de tiquetes con fecha/hora ya separadas ────
     progress_fn(28)
     log_fn("INFO", "Paso 1 — Separando col M (FEC.SALIDA) en FECHA y HORA...")
 
-    # Índice: str_cedula -> lista de entradas ordenadas por FEC.SALIDA
-    tiq_index = {}
+    tiq_index = {}   # str_cedula -> [{ orden_str, tiquete, fecha, hora, raw_fec }]
+    filas_sin_cedula = 0
     for _, row in df_tiq.iterrows():
         o_str = to_str_orden(row.get("NRO ORDEN CREDITO"))   # col N de TIQUETES
         d_str = to_str_doc(row.get("CEDULA PASAJERO"))       # col K de TIQUETES
-        if not o_str or not d_str:
+        if not o_str or not d_str or o_str == "0" or d_str == "0":
+            filas_sin_cedula += 1
             continue
-        fecha, hora = separar_fecha_hora(row.get("FEC.SALIDA"))  # col M
+        fecha, hora = separar_fecha_hora(row.get("FEC.SALIDA"))
         tiq_index.setdefault(d_str, []).append({
             "orden_str": o_str,
             "tiquete":   str(row["TIQUETE"]).strip(),
@@ -195,17 +260,19 @@ def procesar(ruta_mes, ruta_tiquetes, log_fn, progress_fn):
             "raw_fec":   row.get("FEC.SALIDA"),
         })
 
-    # Ordenar cronológicamente
-    for d in tiq_index:
+    for d in tiq_index:   # ordenar cronológicamente
         tiq_index[d].sort(key=lambda x: str(x["raw_fec"]) if x["raw_fec"] else "")
+
+    log_fn("INFO", f"  Cédulas únicas en TIQUETES: {len(tiq_index)}")
+    log_fn("INFO", f"  Filas de tiquetes sin cédula/orden válida: {filas_sin_cedula}")
 
     # ── Pasos 2 & 3: planificar expansión y asignación ────────────
     progress_fn(40)
     log_fn("INFO", "Paso 2 — Planificando expansión por cantidad de pasajes...")
     log_fn("INFO", "Paso 3 — Comparando col K+N (TIQUETES) con col J+A (MES)...")
 
-    col_map_orig = {wb_orig_ws.cell(1, c).value: c
-                    for c in range(1, wb_orig_ws.max_column + 1)}
+    col_map_orig  = {_wb_orig_ws.cell(1, c).value: c
+                     for c in range(1, _wb_orig_ws.max_column + 1)}
     col_cant_orig = col_map_orig.get("Cantidad de Pasajes", 14)
 
     plan = []
@@ -213,19 +280,18 @@ def procesar(ruta_mes, ruta_tiquetes, log_fn, progress_fn):
 
     for df_idx in df_mes.index:
         excel_row_orig = df_idx + 2
-        o_mes = to_str_orden(df_mes.loc[df_idx, "Nro orden de compra"])   # col A
-        d_mes = to_str_doc(df_mes.loc[df_idx, "Número de Documento"])     # col J
+        o_mes_str = to_str_orden(df_mes.loc[df_idx, "Nro orden de compra"])  # col A
+        d_mes_str = to_str_doc(df_mes.loc[df_idx, "Número de Documento"])    # col J
 
-        val_cant = wb_orig_ws.cell(excel_row_orig, col_cant_orig).value
+        val_cant = _wb_orig_ws.cell(excel_row_orig, col_cant_orig).value
         try:
             cantidad = int(val_cant) if val_cant and int(val_cant) > 0 else 1
         except (TypeError, ValueError):
             cantidad = 1
 
-        # Buscar candidatos: cédula igual (col K==J) Y orden compatible (col N≈A)
         candidatos = [
-            e for e in tiq_index.get(d_mes, [])
-            if orden_coincide(o_mes, e["orden_str"])
+            e for e in tiq_index.get(d_mes_str, [])
+            if orden_coincide(o_mes_str, e["orden_str"])
         ]
 
         plan.append((excel_row_orig, cantidad, candidatos))
@@ -258,10 +324,9 @@ def procesar(ruta_mes, ruta_tiquetes, log_fn, progress_fn):
     col_tar  = col_map["Tarifa"]
     col_tot  = col_map["TOTAL"]
     n_cols   = ws.max_column
-
     amarillo = PatternFill("solid", fgColor="FFFF00")
 
-    # ── Expandir filas y llenar B, C, D ──────────────────────────
+    # ── Expandir filas y escribir B, C, D ─────────────────────────
     progress_fn(68)
     log_fn("INFO", "Expandiendo filas y escribiendo datos en col B, C, D...")
 
@@ -274,11 +339,11 @@ def procesar(ruta_mes, ruta_tiquetes, log_fn, progress_fn):
     for (orig_row, cantidad, candidatos) in plan:
         disponibles = [e for e in candidatos if e["tiquete"] not in tiquetes_usados]
 
-        for rep in range(cantidad):
+        for _rep in range(cantidad):
             ws.append([None] * n_cols)
 
             for c in range(1, n_cols + 1):
-                src = wb_orig_ws.cell(orig_row, c)
+                src = _wb_orig_ws.cell(orig_row, c)
                 dst = ws.cell(write_row, c)
                 if src.has_style:
                     dst.font          = copy(src.font)
@@ -289,9 +354,9 @@ def procesar(ruta_mes, ruta_tiquetes, log_fn, progress_fn):
                 if c == col_cant:
                     dst.value = 1
                 elif c == col_tot:
-                    dst.value = wb_orig_ws.cell(orig_row, col_tar).value or 0
+                    dst.value = _wb_orig_ws.cell(orig_row, col_tar).value or 0
                 elif c in (col_tiq, col_fec, col_hora):
-                    dst.value = None
+                    dst.value = None   # limpiar valores previos
                 else:
                     dst.value = src.value
 
@@ -315,7 +380,6 @@ def procesar(ruta_mes, ruta_tiquetes, log_fn, progress_fn):
 
     total_filas   = write_row - 2
     tiq_asignados = len(tiquetes_usados)
-
     log_fn("OK", f"Tiquetes asignados en col B: {tiq_asignados}")
     log_fn("OK", f"Filas expandidas (pasajes > 1): {filas_expandidas}")
     log_fn("OK", f"Total filas en archivo final: {total_filas}")
@@ -372,27 +436,32 @@ class FileCard(tk.Frame):
         super().__init__(parent, bg=C["surface"],
                          highlightbackground=C["border"], highlightthickness=1, **kw)
         self.var = tk.StringVar()
+
         nf = tk.Frame(self, bg=C["accent"], width=32, height=32)
         nf.pack_propagate(False)
         nf.pack(side="left", padx=(16, 12), pady=16)
         tk.Label(nf, text=str(number), font=("Helvetica", 11, "bold"),
                  fg=C["surface"], bg=C["accent"]).place(relx=0.5, rely=0.5, anchor="center")
+
         center = tk.Frame(self, bg=C["surface"])
         center.pack(side="left", fill="x", expand=True, pady=12)
         tk.Label(center, text=label.upper(), font=FT["label"],
                  fg=C["text2"], bg=C["surface"], anchor="w").pack(fill="x")
-        self.path_lbl = tk.Label(center, text="Haz clic para seleccionar archivo…",
+        self.path_lbl = tk.Label(center, text="Haz clic para seleccionar archivo...",
                                  font=FT["body"], fg=C["text3"], bg=C["surface"], anchor="w")
         self.path_lbl.pack(fill="x")
+
         tk.Button(self, text="Examinar", font=FT["small"],
                   fg=C["text"], bg=C["surface2"],
                   activebackground=C["border"], activeforeground=C["text"],
                   relief="flat", bd=0, padx=14, pady=6, cursor="hand2",
                   command=lambda: self._browse(extensions)
                   ).pack(side="right", padx=16, pady=16)
-        self.dot = tk.Label(self, text="●", font=("Helvetica", 8),
+
+        self.dot = tk.Label(self, text="*", font=("Helvetica", 14, "bold"),
                             fg=C["border"], bg=C["surface"])
-        self.dot.place(relx=1.0, rely=0.0, x=-8, y=8, anchor="ne")
+        self.dot.place(relx=1.0, rely=0.0, x=-10, y=6, anchor="ne")
+
         for w in [self, center, self.path_lbl]:
             w.bind("<Enter>", self._on_enter)
             w.bind("<Leave>", self._on_leave)
@@ -423,7 +492,7 @@ class StatCard(tk.Frame):
         bg, fg = C[color_key + "_bg"], C[color_key]
         super().__init__(parent, bg=bg,
                          highlightbackground=C["border"], highlightthickness=1, **kw)
-        self._var = tk.StringVar(value="—")
+        self._var = tk.StringVar(value="--")
         tk.Label(self, textvariable=self._var, font=FT["stat"], fg=fg, bg=bg).pack(pady=(14, 2))
         tk.Label(self, text=label.upper(), font=FT["statl"], fg=fg, bg=bg,
                  wraplength=110, justify="center").pack(pady=(0, 14))
@@ -433,7 +502,7 @@ class StatCard(tk.Frame):
 
 
 class LogLine(tk.Frame):
-    _ICONS  = {"OK": "✓", "WARN": "⚠", "ERR": "✕", "INFO": "·"}
+    _ICONS  = {"OK": "+", "WARN": "!", "ERR": "X", "INFO": "."}
     _COLORS = {
         "OK":   (C["ok"],    C["ok_bg"]),
         "WARN": (C["warn"],  C["warn_bg"]),
@@ -444,7 +513,7 @@ class LogLine(tk.Frame):
     def __init__(self, parent, level, message, **kw):
         fg, bg = self._COLORS.get(level, (C["text2"], C["surface"]))
         super().__init__(parent, bg=bg, **kw)
-        tk.Label(self, text=self._ICONS.get(level, "·"),
+        tk.Label(self, text=self._ICONS.get(level, "."),
                  font=("Helvetica", 9, "bold"), fg=fg, bg=bg, width=2
                  ).pack(side="left", padx=(8, 4), pady=3)
         tk.Label(self, text=message, font=FT["log"],
@@ -466,7 +535,7 @@ class AnimatedButton(tk.Button):
 class ProgressBar(tk.Canvas):
     def __init__(self, parent, **kw):
         super().__init__(parent, height=4, bg=C["progress_bg"], highlightthickness=0, **kw)
-        self._pct = self._target = 0
+        self._pct = self._target = 0.0
         self._bar = self.create_rectangle(0, 0, 0, 4, fill=C["progress_fill"], width=0)
         self.bind("<Configure>", self._draw)
 
@@ -474,7 +543,7 @@ class ProgressBar(tk.Canvas):
         self.coords(self._bar, 0, 0, int(self.winfo_width() * self._pct / 100), 4)
 
     def set_target(self, pct):
-        self._target = pct
+        self._target = float(pct)
         self._step()
 
     def _step(self):
@@ -487,7 +556,7 @@ class ProgressBar(tk.Canvas):
         self.after(16, self._step)
 
     def reset(self):
-        self._pct = self._target = 0
+        self._pct = self._target = 0.0
         self._draw()
 
 
@@ -507,26 +576,31 @@ class App(tk.Tk):
         outer = tk.Frame(self, bg=C["bg"])
         outer.pack(fill="both", expand=True, padx=32, pady=28)
 
+        # Encabezado
         hdr = tk.Frame(outer, bg=C["bg"])
         hdr.pack(fill="x", pady=(0, 6))
-        tk.Label(hdr, text="Cruce", font=FT["title"], fg=C["text"], bg=C["bg"]).pack(side="left")
-        tk.Label(hdr, text=" COMFACHOCO", font=("Georgia", 18), fg=C["text2"], bg=C["bg"]).pack(side="left")
+        tk.Label(hdr, text="Cruce", font=FT["title"],
+                 fg=C["text"], bg=C["bg"]).pack(side="left")
+        tk.Label(hdr, text=" COMFACHOCO", font=("Georgia", 18),
+                 fg=C["text2"], bg=C["bg"]).pack(side="left")
         tk.Label(hdr, text="Tiquetes vs Autorizaciones",
-                 font=FT["sub"], fg=C["text3"], bg=C["bg"]).pack(side="right", anchor="s", pady=4)
+                 font=FT["sub"], fg=C["text3"], bg=C["bg"]
+                 ).pack(side="right", anchor="s", pady=4)
 
         tk.Label(outer,
-                 text="Compara cédula (col K↔J) y orden (col N↔A) entre archivos, "
+                 text="Compara cedula (col K<->J) y orden (col N<->A) entre archivos, "
                       "y completa las columnas B, C y D del archivo MES.",
                  font=FT["small"], fg=C["text3"], bg=C["bg"],
                  anchor="w", justify="left", wraplength=480).pack(fill="x", pady=(0, 16))
 
         tk.Frame(outer, bg=C["border"], height=1).pack(fill="x", pady=(0, 20))
 
+        # Archivos de entrada
         tk.Label(outer, text="ARCHIVOS DE ENTRADA", font=FT["label"],
                  fg=C["text3"], bg=C["bg"], anchor="w").pack(fill="x", pady=(0, 8))
 
         self.card_mes = FileCard(outer, 1,
-                                 "Archivo MES — Autorizaciones COMFACHOCO",
+                                 "Archivo MES - Autorizaciones COMFACHOCO",
                                  "*.xlsx *.xls")
         self.card_mes.pack(fill="x", pady=(0, 8))
 
@@ -539,13 +613,14 @@ class App(tk.Tk):
                         highlightbackground=C["border"], highlightthickness=1)
         nota.pack(fill="x", pady=(10, 0))
         tk.Label(nota,
-                 text="El archivo actualizado se generará automáticamente "
+                 text="El archivo actualizado se generara automaticamente "
                       "en la misma carpeta que el archivo MES.",
                  font=FT["small"], fg=C["info"], bg=C["info_bg"],
                  anchor="w", pady=8, padx=12).pack(fill="x")
 
         tk.Frame(outer, bg=C["border"], height=1).pack(fill="x", pady=(20, 16))
 
+        # Barra de progreso
         self.progress = ProgressBar(outer, width=480)
         self.progress.pack(fill="x", pady=(0, 6))
         self.status_var = tk.StringVar(value="Listo para procesar")
@@ -555,6 +630,7 @@ class App(tk.Tk):
         self.btn = AnimatedButton(outer, text="Procesar archivos", command=self._run)
         self.btn.pack(fill="x", pady=(14, 0))
 
+        # Tarjetas de resultados
         tk.Frame(outer, bg=C["border"], height=1).pack(fill="x", pady=(20, 16))
         tk.Label(outer, text="RESULTADOS", font=FT["label"],
                  fg=C["text3"], bg=C["bg"], anchor="w").pack(fill="x", pady=(0, 10))
@@ -569,6 +645,7 @@ class App(tk.Tk):
             s.grid(row=0, column=i, padx=(0, 8) if i < 3 else 0, sticky="nsew")
             sf.columnconfigure(i, weight=1)
 
+        # Registro de actividad
         tk.Frame(outer, bg=C["border"], height=1).pack(fill="x", pady=(20, 16))
         tk.Label(outer, text="REGISTRO DE ACTIVIDAD", font=FT["label"],
                  fg=C["text3"], bg=C["bg"], anchor="w").pack(fill="x", pady=(0, 8))
@@ -580,10 +657,12 @@ class App(tk.Tk):
         self.log_inner.pack(fill="both", expand=True)
         self._placeholder = tk.Label(
             self.log_inner,
-            text="El registro aparecerá aquí una vez iniciado el proceso.",
+            text="El registro aparecera aqui una vez iniciado el proceso.",
             font=FT["small"], fg=C["text3"], bg=C["surface"], pady=20)
         self._placeholder.pack()
         self._log_lines = []
+
+    # ── Helpers UI ────────────────────────────────────────────────
 
     def _log(self, level, msg):
         if self._placeholder.winfo_ismapped():
@@ -599,6 +678,12 @@ class App(tk.Tk):
         self._log_lines = []
         self._placeholder.pack()
 
+    def _restaurar_btn(self):
+        self.btn.configure(state="normal", text="Procesar archivos")
+        self.progress.set_target(0)
+
+    # ── Acción principal ──────────────────────────────────────────
+
     def _run(self):
         mes = self.card_mes.get()
         tiq = self.card_tiq.get()
@@ -607,42 +692,42 @@ class App(tk.Tk):
                                    "Selecciona ambos archivos antes de continuar.")
             return
 
-        self.btn.configure(state="disabled", text="Procesando…")
+        self.btn.configure(state="disabled", text="Procesando...")
         self.progress.reset()
         self._clear_log()
         for s in [self.s_ok, self.s_no, self.s_tiq, self.s_total]:
-            s.set("—")
+            s.set("--")
 
         def log_fn(level, msg):
             self.after(0, lambda lv=level, m=msg: self._log(lv, m))
 
         def progress_fn(pct):
-            self.after(0, lambda p=pct: (
-                self.progress.set_target(p),
-                self.status_var.set(f"Procesando… {p}%")
-            ))
+            self.after(0, lambda p=pct: self.progress.set_target(p))
+            self.after(0, lambda p=pct: self.status_var.set(f"Procesando... {p}%"))
 
         def worker():
             try:
                 ruta, ok, no, tiq_n, total = procesar(mes, tiq, log_fn, progress_fn)
+                ruta_c, ok_c, no_c, tiq_c, total_c = ruta, ok, no, tiq_n, total
                 def done():
-                    self.s_ok.set(ok)
-                    self.s_no.set(no)
-                    self.s_tiq.set(tiq_n)
-                    self.s_total.set(total)
-                    self.status_var.set(f"Completado — {os.path.basename(ruta)}")
-                    self.btn.configure(state="normal", text="Procesar archivos")
+                    self.s_ok.set(ok_c)
+                    self.s_no.set(no_c)
+                    self.s_tiq.set(tiq_c)
+                    self.s_total.set(total_c)
+                    self.status_var.set(f"Completado — {os.path.basename(ruta_c)}")
+                    self._restaurar_btn()
                     messagebox.showinfo(
                         "Proceso completado",
-                        f"Archivo generado exitosamente.\n\nUbicación:\n{ruta}"
+                        f"Archivo generado exitosamente.\n\nUbicacion:\n{ruta_c}"
                     )
                 self.after(0, done)
-            except Exception as e:
-                def on_err():
-                    self._log("ERR", str(e))
+            except Exception as exc:
+                err_msg = str(exc)
+                def on_err(msg=err_msg):
+                    self._log("ERR", msg)
                     self.status_var.set("Error durante el proceso")
-                    self.btn.configure(state="normal", text="Procesar archivos")
-                    messagebox.showerror("Error", str(e))
+                    self._restaurar_btn()
+                    messagebox.showerror("Error", msg)
                 self.after(0, on_err)
 
         threading.Thread(target=worker, daemon=True).start()
