@@ -1,35 +1,19 @@
+
 # python setup.py build
 # python setup.py bdist_msi - instalador
-
+# C:\Users\Lainer Cáceres\AppData\Local\Programs\documents
 from cx_Freeze import setup, Executable
-
-build_exe_options = {
-    "packages": [
-        "pandas",
-        "openpyxl",
-        "numpy",
-        "xlrd",    
-    ],
-    "includes": [
-        "tkinter"
-    ],
-    "include_files": [
-        "icon.ico",
-        "ui.py",
-        "documents.py"
-    ],
-}
 
 setup(
     name="documents",
-    version="1.0",
-    description="Comparador de archivos Excel - Expreso del Pacífico",
-    options={"build_exe": build_exe_options},
-    executables=[
-        Executable(
-            "documents.py",
-            base="Win32GUI",
-            icon="icon.ico"
-        )
-    ],
+    version="4.2",
+    description="Compara dos documentos excel y genera otro con las coincidencias.",
+    executables=[Executable("documents.py", base="Win32GUI", icon="icon.ico")],
+    options={
+        "build_exe": {
+            "packages": [ "openpyxl", "pandas"],
+            "include_files": [],  
+        }
+    },
 )
+
