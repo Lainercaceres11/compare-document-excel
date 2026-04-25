@@ -1,37 +1,33 @@
 """
 comparar_tiquetes_gui.py  —  Herramienta de cruce COMFACHOCO
 ═══════════════════════════════════════════════════════════════
-PROPÓSITO (reutilizable para cualquier mes):
+Compatible con CUALQUIER variante del archivo MES y TIQUETES:
 
-Cruza dos archivos Excel periódicos de COMFACHOCO:
+  ARCHIVO MES
+    · Encabezado en fila 1 (FEBRERO_2026) o fila 2 (MARZO_2026) — auto-detectado
+    · Columna TIQUETE con nombre "NUMERO DEL TIQUETE" (FEBRERO) o sin nombre (MARZO)
+    · Nombres de columnas en mayúsculas o mixtos ("Fecha","Hora","Total")
 
-  Archivo MES (ej. FEBRERO_2026_PARA_LAINER.xlsx)
-    Col A: Nro orden de compra   <- clave de comparación
-    Col B: NUMERO DEL TIQUETE    <- se llena con este proceso
-    Col C: FECHA                 <- se llena con este proceso
-    Col D: HORA                  <- se llena con este proceso
-    Col J: Número de Documento   <- clave de comparación (cédula)
-    Col N: Cantidad de Pasajes   <- controla la expansión de filas
+  ARCHIVO TIQUETES
+    · .xls (FEBRERO) o .xlsx (MARZO)
+    · Encabezado auto-detectado buscando la celda "TIQUETE"
+    · Columnas requeridas: TIQUETE, CEDULA PASAJERO, FEC.SALIDA, NRO ORDEN CREDITO
 
-  Archivo TIQUETES (ej. TIQUETES_EXPEDIDIOS_EN_FEBRERO_2026.xls)
-    Col K: CEDULA PASAJERO       <- clave de comparación con col J de MES
-    Col M: FEC.SALIDA            <- fecha + hora del viaje (se separa)
-    Col N: NRO ORDEN CREDITO     <- clave de comparación con col A de MES
+ESTRATEGIA DE COMPARACIÓN — cuatro niveles de prioridad:
 
-ESTRATEGIA DE COMPARACIÓN:
-  Coincide si: CEDULA (K==J)  Y  orden compatible (N~=A):
-    1. Match exacto:  str(orden_tiq) == str(orden_mes)
-    2. Match prefijo: str(orden_tiq).startswith(str(orden_mes))
-       (NRO ORDEN CREDITO puede tener dígitos extra al final,
-        ej. FEBRERO=2026017179 <-> TIQUETES=20260171799)
+    Nivel 1 — Exacto:    orden_tiq == orden_mes
+    Nivel 2 — Prefijo:   orden_tiq.startswith(orden_mes)
+              (sistemas que añaden dígitos al final,
+               ej. MES=2026017179 ↔ TIQUETES=20260171799)
+    Nivel 3 — Aproximado protegido:
+              |int(orden_tiq) − int(orden_mes)| ≤ TOLERANCIA_ORDEN
+              SOLO si orden_tiq NO tiene match exacto/prefijo con ninguna
+              OTRA orden del mismo pasajero en el MES.
+    Nivel 4 — Sin número de orden (NRO ORDEN CREDITO = 0 o vacío):
+              Asignación por cédula sola, prioridad mínima.
 
-  NO se usa matching numérico aproximado porque órdenes de ida y vuelta
-  del mismo usuario tienen números consecutivos (ej. 2026026318 y 2026026328)
-  y mezclarlas sería incorrecto.
-
-NOTAS:
-  - Cada tiquete se asigna una sola vez (no se repite).
-  - Los tiquetes se asignan en orden cronológico (FEC.SALIDA).
+  Candidatos ordenados por nivel, luego cronológicamente (FEC.SALIDA).
+  Cada tiquete se asigna UNA SOLA VEZ.
 """
 
 import subprocess, os, shutil, threading
@@ -44,8 +40,69 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 
+TOLERANCIA_ORDEN = 20
+
+
 # ══════════════════════════════════════════════════════════════════
-#  UTILIDADES
+#  DETECCIÓN AUTOMÁTICA DE ESTRUCTURA
+# ══════════════════════════════════════════════════════════════════
+
+def detectar_fila(ws, texto, max_filas=10):
+    """
+    Fila (1-indexada) donde aparece 'texto'. Lanza RuntimeError si no encuentra.
+    """
+    for row in range(1, max_filas + 1):
+        for col in range(1, ws.max_column + 1):
+            v = ws.cell(row, col).value
+            if v is not None and str(v).strip() == texto:
+                return row
+    raise RuntimeError(
+        f"No se encontró '{texto}' en las primeras {max_filas} filas.\n"
+        "Verifique que seleccionó el archivo correcto."
+    )
+
+
+def construir_col_map(ws, header_row):
+    """Dict {nombre_columna: número_columna} desde la fila de encabezado."""
+    return {
+        ws.cell(header_row, c).value: c
+        for c in range(1, ws.max_column + 1)
+        if ws.cell(header_row, c).value is not None
+    }
+
+
+def buscar_col(col_map, *nombres):
+    """
+    Número de columna por nombre, insensible a mayúsculas/espacios.
+    Devuelve None si no encuentra ninguno.
+    """
+    upper = {k.strip().upper(): v for k, v in col_map.items() if k is not None}
+    for n in nombres:
+        key = n.strip().upper()
+        if key in upper:
+            return upper[key]
+    return None
+
+
+def detectar_col_tiq(ws, col_map, header_row):
+    """
+    Columna donde se escribirá el número de tiquete:
+    · FEBRERO: columna con nombre "NUMERO DEL TIQUETE"
+    · MARZO:   primera columna SIN nombre antes de "Nro orden de compra"
+    """
+    col = buscar_col(col_map, "NUMERO DEL TIQUETE", "NUMERO TIQUETE", "NRO TIQUETE")
+    if col is not None:
+        return col
+    # Fallback: primera columna vacía antes de la columna de orden
+    col_orden = buscar_col(col_map, "Nro orden de compra") or ws.max_column
+    for c in range(1, col_orden):
+        if ws.cell(header_row, c).value is None:
+            return c
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════
+#  LECTURA DE ARCHIVOS
 # ══════════════════════════════════════════════════════════════════
 
 def buscar_libreoffice():
@@ -65,111 +122,119 @@ def buscar_libreoffice():
 
 def convertir_xls(ruta_xls, ejecutable, log_fn):
     """
-    Convierte .xls a .xlsx usando LibreOffice.
-
-    CORRECCIONES vs versión anterior:
-      1. Invalida la caché si el .xls es más nuevo que el _converted.xlsx.
-      2. Busca el archivo de salida en múltiples directorios porque
-         LibreOffice a veces ignora --outdir y escribe en el directorio
-         de trabajo actual o en la raíz del sistema de archivos.
+    Convierte .xls → .xlsx con LibreOffice.
+    Invalida la caché si el .xls es más reciente.
+    Busca el resultado en múltiples directorios.
     """
-    carpeta    = os.path.dirname(os.path.abspath(ruta_xls))
-    base       = os.path.splitext(os.path.basename(ruta_xls))[0]
-    destino    = os.path.join(carpeta, base + "_converted.xlsx")
+    carpeta = os.path.dirname(os.path.abspath(ruta_xls))
+    base    = os.path.splitext(os.path.basename(ruta_xls))[0]
+    destino = os.path.join(carpeta, base + "_converted.xlsx")
 
-    # ── CORRECCIÓN 1: invalidar caché si el xls es más reciente ──
     if os.path.exists(destino):
-        mtime_xls     = os.path.getmtime(ruta_xls)
-        mtime_destino = os.path.getmtime(destino)
-        if mtime_xls > mtime_destino:
-            log_fn("INFO", "  Caché de conversión obsoleta, reconvirtiendo...")
+        if os.path.getmtime(ruta_xls) > os.path.getmtime(destino):
+            log_fn("INFO", "  Caché obsoleta, reconvirtiendo .xls...")
             os.remove(destino)
         else:
             log_fn("INFO", "  Usando conversión en caché...")
             return destino
 
-    # ── Ejecutar LibreOffice ──────────────────────────────────────
     cwd = os.getcwd()
     result = subprocess.run(
         [ejecutable, "--headless", "--convert-to", "xlsx",
          os.path.abspath(ruta_xls), "--outdir", carpeta],
-        capture_output=True, text=True,
-        cwd=carpeta   # forzar directorio de trabajo = carpeta del archivo
+        capture_output=True, text=True, cwd=carpeta,
     )
     if result.returncode != 0:
         raise RuntimeError(f"LibreOffice no pudo convertir el archivo.\n{result.stderr}")
 
-    # ── CORRECCIÓN 2: buscar el archivo en múltiples ubicaciones ──
     nombre_xlsx = base + ".xlsx"
-    posibles    = [
-        os.path.join(carpeta, nombre_xlsx),          # lo normal
-        os.path.join(cwd, nombre_xlsx),              # directorio de trabajo
-        os.path.join("/", nombre_xlsx),              # raíz (Linux/Mac)
-        os.path.join(os.path.expanduser("~"), nombre_xlsx),  # home
+    posibles = [
+        os.path.join(carpeta, nombre_xlsx),
+        os.path.join(cwd, nombre_xlsx),
+        os.path.join("/", nombre_xlsx),
+        os.path.join(os.path.expanduser("~"), nombre_xlsx),
     ]
-
-    encontrado = None
-    for p in posibles:
-        if os.path.exists(p):
-            encontrado = p
-            break
-
+    encontrado = next((p for p in posibles if os.path.exists(p)), None)
     if encontrado is None:
         raise RuntimeError(
-            f"LibreOffice completó sin errores pero no se encontró el archivo "
-            f"convertido '{nombre_xlsx}'.\n"
-            f"Se buscó en: {posibles}\n"
-            f"Salida de LibreOffice: {result.stdout}"
+            f"LibreOffice terminó pero no se encontró '{nombre_xlsx}'.\n"
+            f"Buscado en: {posibles}"
         )
-
     if encontrado != destino:
         shutil.move(encontrado, destino)
-
     return destino
 
 
+def leer_mes(ruta):
+    """
+    Lee el archivo MES. Detecta automáticamente la fila del encabezado
+    buscando 'Nro orden de compra'.
+    Devuelve (df, header_excel_row).
+    """
+    wb = load_workbook(ruta, read_only=True)
+    ws = wb.active
+    hrow = detectar_fila(ws, "Nro orden de compra")
+    wb.close()
+    df = pd.read_excel(ruta, header=hrow - 1)
+    return df, hrow
+
+
 def leer_tiquetes(ruta, log_fn):
-    """Lee TIQUETES EXPEDIDOS (.xls o .xlsx). El encabezado real está en la fila 6."""
+    """
+    Lee TIQUETES EXPEDIDOS (.xls o .xlsx).
+    Detecta automáticamente la fila del encabezado buscando 'TIQUETE'.
+    """
     ext = os.path.splitext(ruta)[1].lower()
+
     if ext == ".xlsx":
-        df = pd.read_excel(ruta, header=5)
+        wb = load_workbook(ruta, read_only=True)
+        ws = wb.active
+        hrow = detectar_fila(ws, "TIQUETE")
+        wb.close()
+        log_fn("INFO", f"  Encabezado TIQUETES en fila {hrow}")
+        df = pd.read_excel(ruta, header=hrow - 1)
         df.columns = df.columns.str.strip()
         return df
 
+    # .xls → convertir con LibreOffice
     lo = buscar_libreoffice()
     if lo:
         log_fn("INFO", "  Convirtiendo .xls con LibreOffice...")
         ruta_conv = convertir_xls(ruta, lo, log_fn)
-        df = pd.read_excel(ruta_conv, header=5)
+        wb = load_workbook(ruta_conv, read_only=True)
+        ws = wb.active
+        hrow = detectar_fila(ws, "TIQUETE")
+        wb.close()
+        log_fn("INFO", f"  Encabezado TIQUETES en fila {hrow}")
+        df = pd.read_excel(ruta_conv, header=hrow - 1)
         df.columns = df.columns.str.strip()
-        # Verificar que el archivo tiene datos reales
         if df.empty or "CEDULA PASAJERO" not in df.columns:
             raise RuntimeError(
-                "El archivo de tiquetes convertido no tiene la estructura esperada.\n"
-                f"Columnas encontradas: {list(df.columns)}\n"
-                "Asegúrese de que el archivo .xls es el correcto."
+                "El archivo de tiquetes no tiene la estructura esperada.\n"
+                f"Columnas: {list(df.columns)}"
             )
         return df
 
+    # Fallback: xlrd
     log_fn("INFO", "  Usando xlrd para leer .xls...")
     try:
         import xlrd  # noqa
     except ImportError:
-        raise ImportError(
-            "Para leer .xls instala xlrd:  pip install xlrd\n"
-            "O instala LibreOffice (gratis)."
-        )
+        raise ImportError("Instala xlrd: pip install xlrd  o instala LibreOffice.")
     df_raw = pd.read_excel(ruta, header=None, engine="xlrd")
-    header_row = next(
+    hrow_idx = next(
         i for i, row in df_raw.iterrows()
         if any(str(v).strip().upper() == "TIQUETE" for v in row)
     )
-    df_raw.columns = df_raw.iloc[header_row].str.strip()
-    return df_raw.iloc[header_row + 1:].reset_index(drop=True)
+    df_raw.columns = df_raw.iloc[hrow_idx].str.strip()
+    return df_raw.iloc[hrow_idx + 1:].reset_index(drop=True)
 
+
+# ══════════════════════════════════════════════════════════════════
+#  UTILIDADES DE DATOS
+# ══════════════════════════════════════════════════════════════════
 
 def to_str_orden(v):
-    """Convierte un número de orden a string entero limpio."""
     try:
         return str(int(float(v))) if v is not None and not pd.isna(v) else ""
     except (ValueError, TypeError):
@@ -177,7 +242,6 @@ def to_str_orden(v):
 
 
 def to_str_doc(v):
-    """Convierte un número de documento/cédula a string entero limpio."""
     try:
         return str(int(float(v))) if v is not None and not pd.isna(v) else ""
     except (ValueError, TypeError):
@@ -185,7 +249,6 @@ def to_str_doc(v):
 
 
 def separar_fecha_hora(valor):
-    """Separa FEC.SALIDA en (fecha 'DD/MM/YYYY', hora 'HH:MM:SS')."""
     if valor is None or (isinstance(valor, float) and pd.isna(valor)):
         return None, None
     if isinstance(valor, datetime):
@@ -197,59 +260,101 @@ def separar_fecha_hora(valor):
         return str(valor), None
 
 
-def orden_coincide(o_mes, o_tiq):
+def exacto_o_prefijo(o_tiq, o_mes):
+    return bool(o_tiq) and bool(o_mes) and (o_tiq == o_mes or o_tiq.startswith(o_mes))
+
+
+def get_candidatos(o_mes, d_mes, tiq_index, otras_ordenes):
     """
-    True si o_mes y o_tiq se consideran la misma orden:
-      - Exacto: o_tiq == o_mes
-      - Prefijo: o_tiq.startswith(o_mes)  (dígitos extra en TIQUETES)
+    Candidatos para la fila (o_mes, d_mes), ordenados por prioridad:
+      0   — Exacto/prefijo con esta orden
+      1…N — Aproximado protegido (no pertenece a otra orden del mismo pasajero)
+      999 — Sin número de orden (por cédula sola)
     """
-    if not o_mes or not o_tiq:
-        return False
-    return o_tiq == o_mes or o_tiq.startswith(o_mes)
+    cands = []
+    for e in tiq_index.get(d_mes, []):
+        o_tiq = e["orden_str"]
+        if exacto_o_prefijo(o_tiq, o_mes):
+            cands.append((0, e))
+        elif o_tiq in ("", "0"):
+            cands.append((999, e))
+        else:
+            # Aproximado: solo si ninguna OTRA orden del pasajero lo reclama
+            if not any(exacto_o_prefijo(o_tiq, o) for o in otras_ordenes):
+                try:
+                    diff = abs(int(o_tiq) - int(o_mes))
+                    if diff <= TOLERANCIA_ORDEN:
+                        cands.append((diff, e))
+                except (ValueError, TypeError):
+                    pass
+    cands.sort(key=lambda x: (x[0], str(x[1].get("raw_fec", "") or "")))
+    return [e for _, e in cands]
 
 
 # ══════════════════════════════════════════════════════════════════
 #  NÚCLEO DEL PROCESO
 # ══════════════════════════════════════════════════════════════════
 
-_wb_orig_ws = None   # referencia global al ws original (para copiar estilos)
+_wb_orig_ws = None
 
 
 def procesar(ruta_mes, ruta_tiquetes, log_fn, progress_fn):
     global _wb_orig_ws
 
-    # ── Leer archivos ──────────────────────────────────────────────
+    # ── Leer MES ───────────────────────────────────────────────────
     progress_fn(5)
     log_fn("INFO", "Leyendo archivo MES...")
-    df_mes    = pd.read_excel(ruta_mes)
-    wb_orig   = load_workbook(ruta_mes)
+    df_mes, hrow_mes = leer_mes(ruta_mes)
+    wb_orig = load_workbook(ruta_mes)
     _wb_orig_ws = wb_orig.active
+    log_fn("INFO", f"  Encabezado en fila {hrow_mes} | {len(df_mes)} filas de datos")
 
+    # ── Leer TIQUETES ──────────────────────────────────────────────
     progress_fn(15)
     log_fn("INFO", "Leyendo archivo TIQUETES EXPEDIDOS...")
     df_tiq = leer_tiquetes(ruta_tiquetes, log_fn)
-    log_fn("INFO", f"MES: {len(df_mes)} filas  |  TIQUETES: {len(df_tiq)} filas")
+    log_fn("INFO", f"  {len(df_tiq)} tiquetes cargados")
 
-    # ── Validación temprana ────────────────────────────────────────
+    # Validar columnas requeridas
     cols_tiq = set(df_tiq.columns.tolist())
-    for col_req in ("TIQUETE", "CEDULA PASAJERO", "FEC.SALIDA", "NRO ORDEN CREDITO"):
-        if col_req not in cols_tiq:
+    for req in ("TIQUETE", "CEDULA PASAJERO", "FEC.SALIDA", "NRO ORDEN CREDITO"):
+        if req not in cols_tiq:
             raise RuntimeError(
-                f"No se encontró la columna '{col_req}' en el archivo de tiquetes.\n"
+                f"Columna '{req}' no encontrada en TIQUETES.\n"
                 f"Columnas disponibles: {sorted(cols_tiq)}"
             )
 
-    # ── Paso 1: índice de tiquetes con fecha/hora ya separadas ────
-    progress_fn(28)
-    log_fn("INFO", "Paso 1 — Separando col M (FEC.SALIDA) en FECHA y HORA...")
+    # ── Detectar columnas del MES ──────────────────────────────────
+    col_map_mes = construir_col_map(_wb_orig_ws, hrow_mes)
+    upper_mes   = {k.strip().upper(): v for k, v in col_map_mes.items()}
 
-    tiq_index = {}   # str_cedula -> [{ orden_str, tiquete, fecha, hora, raw_fec }]
-    filas_sin_cedula = 0
+    col_cant_r  = upper_mes.get("CANTIDAD DE PASAJES", 15)
+    col_tar_r   = upper_mes.get("TARIFA", 16)
+    col_tiq_r   = detectar_col_tiq(_wb_orig_ws, col_map_mes, hrow_mes)
+    col_fec_r   = upper_mes.get("FECHA", 4)
+    col_hora_r  = upper_mes.get("HORA", 5)
+    col_tot_r   = upper_mes.get("TOTAL", 17)
+
+    if col_tiq_r is None:
+        raise RuntimeError(
+            "No se detectó la columna de TIQUETE en el archivo MES.\n"
+            f"Columnas disponibles: {sorted(col_map_mes.keys())}"
+        )
+    log_fn("INFO",
+           f"  Columnas detectadas: TIQUETE=col{col_tiq_r}, "
+           f"FECHA=col{col_fec_r}, HORA=col{col_hora_r}")
+
+    # ── Paso 1: índice de tiquetes ─────────────────────────────────
+    progress_fn(28)
+    log_fn("INFO", "Paso 1 — Indexando tiquetes por cédula...")
+
+    tiq_index = {}
+    sin_cedula = 0
     for _, row in df_tiq.iterrows():
-        o_str = to_str_orden(row.get("NRO ORDEN CREDITO"))   # col N de TIQUETES
-        d_str = to_str_doc(row.get("CEDULA PASAJERO"))       # col K de TIQUETES
-        if not o_str or not d_str or o_str == "0" or d_str == "0":
-            filas_sin_cedula += 1
+        o_str = to_str_orden(row.get("NRO ORDEN CREDITO"))
+        d_str = to_str_doc(row.get("CEDULA PASAJERO"))
+        if not d_str:
+            sin_cedula += 1
             continue
         fecha, hora = separar_fecha_hora(row.get("FEC.SALIDA"))
         tiq_index.setdefault(d_str, []).append({
@@ -260,48 +365,58 @@ def procesar(ruta_mes, ruta_tiquetes, log_fn, progress_fn):
             "raw_fec":   row.get("FEC.SALIDA"),
         })
 
-    for d in tiq_index:   # ordenar cronológicamente
-        tiq_index[d].sort(key=lambda x: str(x["raw_fec"]) if x["raw_fec"] else "")
-
     log_fn("INFO", f"  Cédulas únicas en TIQUETES: {len(tiq_index)}")
-    log_fn("INFO", f"  Filas de tiquetes sin cédula/orden válida: {filas_sin_cedula}")
+    if sin_cedula:
+        log_fn("INFO", f"  Filas sin cédula: {sin_cedula}")
 
-    # ── Pasos 2 & 3: planificar expansión y asignación ────────────
+    # ── Paso 2: mapa cédula → órdenes en MES ──────────────────────
+    progress_fn(35)
+    log_fn("INFO", "Paso 2 — Mapeando órdenes por pasajero...")
+
+    ced_a_ordenes = {}
+    for df_idx in df_mes.index:
+        o = to_str_orden(df_mes.loc[df_idx, "Nro orden de compra"])
+        d = to_str_doc(df_mes.loc[df_idx, "Número de Documento"])
+        if d and o:
+            ced_a_ordenes.setdefault(d, set()).add(o)
+
+    # ── Paso 3: planificar asignación ─────────────────────────────
     progress_fn(40)
-    log_fn("INFO", "Paso 2 — Planificando expansión por cantidad de pasajes...")
-    log_fn("INFO", "Paso 3 — Comparando col K+N (TIQUETES) con col J+A (MES)...")
-
-    col_map_orig  = {_wb_orig_ws.cell(1, c).value: c
-                     for c in range(1, _wb_orig_ws.max_column + 1)}
-    col_cant_orig = col_map_orig.get("Cantidad de Pasajes", 14)
+    log_fn("INFO", "Paso 3 — Cruzando tiquetes con autorizaciones...")
 
     plan = []
-    filas_ok = filas_no = 0
+    filas_ok = filas_no = filas_aprox = 0
 
     for df_idx in df_mes.index:
-        excel_row_orig = df_idx + 2
-        o_mes_str = to_str_orden(df_mes.loc[df_idx, "Nro orden de compra"])  # col A
-        d_mes_str = to_str_doc(df_mes.loc[df_idx, "Número de Documento"])    # col J
+        excel_row_orig = df_idx + hrow_mes + 1   # fila Excel en el workbook original
+        o_mes = to_str_orden(df_mes.loc[df_idx, "Nro orden de compra"])
+        d_mes = to_str_doc(df_mes.loc[df_idx, "Número de Documento"])
 
-        val_cant = _wb_orig_ws.cell(excel_row_orig, col_cant_orig).value
+        val_cant = _wb_orig_ws.cell(excel_row_orig, col_cant_r).value
         try:
             cantidad = int(val_cant) if val_cant and int(val_cant) > 0 else 1
         except (TypeError, ValueError):
             cantidad = 1
 
-        candidatos = [
-            e for e in tiq_index.get(d_mes_str, [])
-            if orden_coincide(o_mes_str, e["orden_str"])
-        ]
+        otras = ced_a_ordenes.get(d_mes, set()) - {o_mes}
+        candidatos = get_candidatos(o_mes, d_mes, tiq_index, otras)
 
-        plan.append((excel_row_orig, cantidad, candidatos))
         if candidatos:
             filas_ok += 1
+            if any(
+                not exacto_o_prefijo(e["orden_str"], o_mes) and e["orden_str"] not in ("", "0")
+                for e in candidatos
+            ):
+                filas_aprox += 1
         else:
             filas_no += 1
 
-    log_fn("OK",   f"Filas del MES con tiquetes encontrados: {filas_ok}")
-    log_fn("WARN", f"Filas del MES sin tiquetes: {filas_no}")
+        plan.append((excel_row_orig, cantidad, candidatos))
+
+    log_fn("OK",   f"Filas con tiquete encontrado: {filas_ok}")
+    if filas_aprox:
+        log_fn("INFO", f"  De los cuales por match aproximado: {filas_aprox}")
+    log_fn("WARN", f"Filas sin tiquete (no disponibles): {filas_no}")
 
     # ── Preparar archivo de salida ────────────────────────────────
     progress_fn(55)
@@ -316,25 +431,21 @@ def procesar(ruta_mes, ruta_tiquetes, log_fn, progress_fn):
     wb = load_workbook(ruta_salida)
     ws = wb.active
 
-    col_map  = {ws.cell(1, c).value: c for c in range(1, ws.max_column + 1)}
-    col_tiq  = col_map["NUMERO DEL TIQUETE"]
-    col_fec  = col_map["FECHA"]
-    col_hora = col_map["HORA"]
-    col_cant = col_map["Cantidad de Pasajes"]
-    col_tar  = col_map["Tarifa"]
-    col_tot  = col_map["TOTAL"]
     n_cols   = ws.max_column
     amarillo = PatternFill("solid", fgColor="FFFF00")
 
-    # ── Expandir filas y escribir B, C, D ─────────────────────────
+    # ── Expandir filas y escribir ──────────────────────────────────
     progress_fn(68)
-    log_fn("INFO", "Expandiendo filas y escribiendo datos en col B, C, D...")
+    log_fn("INFO", "Expandiendo filas y escribiendo datos...")
 
-    ws.delete_rows(2, ws.max_row - 1)
+    primera_fila_datos = hrow_mes + 1
+    ws.delete_rows(primera_fila_datos, ws.max_row - hrow_mes)
 
     tiquetes_usados  = set()
     filas_expandidas = 0
-    write_row        = 2
+    write_row        = primera_fila_datos
+
+    cols_limpiar = (col_tiq_r, col_fec_r, col_hora_r)
 
     for (orig_row, cantidad, candidatos) in plan:
         disponibles = [e for e in candidatos if e["tiquete"] not in tiquetes_usados]
@@ -351,22 +462,22 @@ def procesar(ruta_mes, ruta_tiquetes, log_fn, progress_fn):
                     dst.border        = copy(src.border)
                     dst.alignment     = copy(src.alignment)
                     dst.number_format = src.number_format
-                if c == col_cant:
+                if c == col_cant_r:
                     dst.value = 1
-                elif c == col_tot:
-                    dst.value = _wb_orig_ws.cell(orig_row, col_tar).value or 0
-                elif c in (col_tiq, col_fec, col_hora):
-                    dst.value = None   # limpiar valores previos
+                elif c == col_tot_r:
+                    dst.value = _wb_orig_ws.cell(orig_row, col_tar_r).value or 0
+                elif c in cols_limpiar:
+                    dst.value = None   # se limpia; si hay tiquete se sobreescribe abajo
                 else:
                     dst.value = src.value
 
             if disponibles:
                 entry = disponibles.pop(0)
                 tiquetes_usados.add(entry["tiquete"])
-                ws.cell(write_row, col_tiq).value = entry["tiquete"]
-                ws.cell(write_row, col_fec).value  = entry["fecha"]
-                ws.cell(write_row, col_hora).value = entry["hora"]
-                for col in [col_tiq, col_fec, col_hora]:
+                ws.cell(write_row, col_tiq_r).value = entry["tiquete"]
+                ws.cell(write_row, col_fec_r).value  = entry["fecha"]
+                ws.cell(write_row, col_hora_r).value = entry["hora"]
+                for col in cols_limpiar:
                     ws.cell(write_row, col).fill = amarillo
 
             if cantidad > 1:
@@ -378,9 +489,9 @@ def procesar(ruta_mes, ruta_tiquetes, log_fn, progress_fn):
     wb.save(ruta_salida)
     progress_fn(100)
 
-    total_filas   = write_row - 2
+    total_filas   = write_row - primera_fila_datos
     tiq_asignados = len(tiquetes_usados)
-    log_fn("OK", f"Tiquetes asignados en col B: {tiq_asignados}")
+    log_fn("OK", f"Tiquetes asignados: {tiq_asignados}")
     log_fn("OK", f"Filas expandidas (pasajes > 1): {filas_expandidas}")
     log_fn("OK", f"Total filas en archivo final: {total_filas}")
 
@@ -576,7 +687,6 @@ class App(tk.Tk):
         outer = tk.Frame(self, bg=C["bg"])
         outer.pack(fill="both", expand=True, padx=32, pady=28)
 
-        # Encabezado
         hdr = tk.Frame(outer, bg=C["bg"])
         hdr.pack(fill="x", pady=(0, 6))
         tk.Label(hdr, text="Cruce", font=FT["title"],
@@ -588,14 +698,13 @@ class App(tk.Tk):
                  ).pack(side="right", anchor="s", pady=4)
 
         tk.Label(outer,
-                 text="Compara cedula (col K<->J) y orden (col N<->A) entre archivos, "
-                      "y completa las columnas B, C y D del archivo MES.",
+                 text="Compara cedula y orden entre archivos y completa "
+                      "tiquete, fecha y hora. Compatible con FEBRERO y MARZO 2026.",
                  font=FT["small"], fg=C["text3"], bg=C["bg"],
                  anchor="w", justify="left", wraplength=480).pack(fill="x", pady=(0, 16))
 
         tk.Frame(outer, bg=C["border"], height=1).pack(fill="x", pady=(0, 20))
 
-        # Archivos de entrada
         tk.Label(outer, text="ARCHIVOS DE ENTRADA", font=FT["label"],
                  fg=C["text3"], bg=C["bg"], anchor="w").pack(fill="x", pady=(0, 8))
 
@@ -606,21 +715,20 @@ class App(tk.Tk):
 
         self.card_tiq = FileCard(outer, 2,
                                  "Archivo TIQUETES EXPEDIDOS",
-                                 "*.xls *.xlsx")
+                                 "*.xlsx *.xls")
         self.card_tiq.pack(fill="x")
 
         nota = tk.Frame(outer, bg=C["info_bg"],
                         highlightbackground=C["border"], highlightthickness=1)
         nota.pack(fill="x", pady=(10, 0))
         tk.Label(nota,
-                 text="El archivo actualizado se generara automaticamente "
+                 text="El archivo actualizado se genera automaticamente "
                       "en la misma carpeta que el archivo MES.",
                  font=FT["small"], fg=C["info"], bg=C["info_bg"],
                  anchor="w", pady=8, padx=12).pack(fill="x")
 
         tk.Frame(outer, bg=C["border"], height=1).pack(fill="x", pady=(20, 16))
 
-        # Barra de progreso
         self.progress = ProgressBar(outer, width=480)
         self.progress.pack(fill="x", pady=(0, 6))
         self.status_var = tk.StringVar(value="Listo para procesar")
@@ -630,7 +738,6 @@ class App(tk.Tk):
         self.btn = AnimatedButton(outer, text="Procesar archivos", command=self._run)
         self.btn.pack(fill="x", pady=(14, 0))
 
-        # Tarjetas de resultados
         tk.Frame(outer, bg=C["border"], height=1).pack(fill="x", pady=(20, 16))
         tk.Label(outer, text="RESULTADOS", font=FT["label"],
                  fg=C["text3"], bg=C["bg"], anchor="w").pack(fill="x", pady=(0, 10))
@@ -645,7 +752,6 @@ class App(tk.Tk):
             s.grid(row=0, column=i, padx=(0, 8) if i < 3 else 0, sticky="nsew")
             sf.columnconfigure(i, weight=1)
 
-        # Registro de actividad
         tk.Frame(outer, bg=C["border"], height=1).pack(fill="x", pady=(20, 16))
         tk.Label(outer, text="REGISTRO DE ACTIVIDAD", font=FT["label"],
                  fg=C["text3"], bg=C["bg"], anchor="w").pack(fill="x", pady=(0, 8))
@@ -661,8 +767,6 @@ class App(tk.Tk):
             font=FT["small"], fg=C["text3"], bg=C["surface"], pady=20)
         self._placeholder.pack()
         self._log_lines = []
-
-    # ── Helpers UI ────────────────────────────────────────────────
 
     def _log(self, level, msg):
         if self._placeholder.winfo_ismapped():
@@ -681,8 +785,6 @@ class App(tk.Tk):
     def _restaurar_btn(self):
         self.btn.configure(state="normal", text="Procesar archivos")
         self.progress.set_target(0)
-
-    # ── Acción principal ──────────────────────────────────────────
 
     def _run(self):
         mes = self.card_mes.get()
